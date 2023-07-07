@@ -1,0 +1,5 @@
+{
+    "[Python]": {
+        "editor.defaultFormatter": "ms-python.autopep8"
+    },
+}
