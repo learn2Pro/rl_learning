@@ -5,6 +5,9 @@ from torch import nn
 from d2l import torch as d2l
 import torch
 import matplotlib.pyplot as plt
+import torchvision
+from torchvision import transforms
+import torch.nn.functional as F
 
 
 def add_to_class(Class):  # @save
@@ -96,8 +99,7 @@ class Module(nn.Module):
         self.plot_train_per_epoch = 2
         self.plot_valid_per_epoch = 1
         self.board = ProgressBoard()
-        self.train_loss = []
-        self.validate_loss = []
+        self.lr = 0.01
 
     def loss(self):
         raise NotImplementedError
@@ -128,16 +130,14 @@ class Module(nn.Module):
         y_hat = self.forward(batch[0])
         y = batch[1]
         l = self.loss(y_hat, y)
-        self.train_loss.append(l.item())
         return l
 
     def validate_step(self, batch):
         l = self.loss(self.forward(batch[0]), batch[-1])
-        self.validate_loss.append(l.item())
         return l
 
     def configure_optimizers(self):
-        raise NotImplementedError
+        return torch.optim.SGD(self.parameters(), lr=self.lr)
 
 
 class DataModule(HyperParameters):  # @save
@@ -167,6 +167,9 @@ class Trainer(HyperParameters):
         assert num_gpus == 0, 'no gpu supported yet'
         self.train_batch_ix = 0
         self.val_batch_idx = 0
+        self.train_loss = []
+        self.validate_loss = []
+        self.acc_array = []
 
     def prepare_data(self, data):
         self.train_dataloader = data.train_dataloader()
@@ -187,8 +190,13 @@ class Trainer(HyperParameters):
         self.epoch = 0
         self.train_batch_idx = 0
         self.val_batch_idx = 0
+        self.t_loss = float('inf')
+        self.v_loss = float('inf')
+        self.acc = float('inf')
         for self.epoch in range(self.max_epochs):
             self.fit_epoch()
+            print(
+                f'complete {self.epoch} epoch train_loss={self.t_loss} validate_loss={self.v_loss}')
 
     def fit_epoch(self):
         self.model.train()
@@ -201,13 +209,29 @@ class Trainer(HyperParameters):
                     self.clip_gradients(self.gradient_clip_val, self.model)
                 self.optim.step()
                 self.train_batch_idx += 1
+        self.t_loss = loss
+        self.train_loss.append(self.t_loss.item())
         if self.val_dataloader is None:
             return
         self.model.eval()
         for batch in self.val_dataloader:
             with torch.no_grad():
-                self.model.validate_step(batch)
+                y_hat, self.v_loss = self.model.validate_step(batch)
+                if hasattr(self.model, 'accuracy'):
+                    self.acc = self.model.accuracy(y_hat, batch[-1])
             self.val_batch_idx += 1
+        self.validate_loss.append(self.v_loss.item())
+        self.acc_array.append(self.acc.item())
+
+    def plot(self, figsize=(5, 2.5)):
+        plt.figure(1, figsize=figsize)
+        plt.plot(self.train_loss, label='train')
+        plt.plot(self.validate_loss, label='validate')
+        plt.plot(self.acc_array, label='accuracy')
+        plt.xlabel = 'epoch'
+        plt.ylabel = 'loss'
+        plt.legend()
+        plt.show()
 
 
 class SyntheticRegressionData(DataModule):  # @save
@@ -225,6 +249,63 @@ class SyntheticRegressionData(DataModule):  # @save
     def get_dataloader(self, train):
         i = slice(0, self.num_train) if train else slice(self.num_train, None)
         return self.get_tensorloader((self.X, self.y), train, i)
+
+
+class Classifier(Module):
+    def __init__(self):
+        super().__init__()
+
+    def validate_step(self, batch):
+        y_hat = self.forward(batch[0])
+        return y_hat, self.loss(y_hat, batch[1])
+
+    def accuracy(self, y_hat, y, averaged=True):
+        cmp = (y_hat.argmax(axis=1) == y).type(torch.float32)
+        return cmp.mean() if averaged else cmp
+
+    def loss(self, y_hat, y):
+        return F.cross_entropy(y_hat, y)
+
+
+class FasionMNIST(DataModule):
+    """The Fashion-MNIST dataset."""
+
+    def __init__(self, batch_size=64, resize=(28, 28)):
+        super().__init__()
+        self.save_hyperparameters()
+        trans = transforms.Compose(
+            [transforms.Resize(resize), transforms.ToTensor()])
+        self.train = torchvision.datasets.FashionMNIST(
+            root='../data', train=True, transform=trans, download=True)
+        self.val = torchvision.datasets.FashionMNIST(
+            root='../data', train=False, transform=trans, download=True)
+        self.num_workers = 1
+        self.batch_size = batch_size
+
+    def text_labels(self, indices):
+        """Return text labels."""
+        labels = ['t-shirt', 'trouser', 'pullover', 'dress', 'coat',
+                  'sandal', 'shirt', 'sneaker', 'bag', 'ankle boot']
+        return [labels[int(i)] for i in indices]
+
+    def get_dataloader(self, train):
+        data = self.train if train else self.val
+        return torch.utils.data.DataLoader(data, self.batch_size, shuffle=train, num_workers=self.num_workers)
+
+    def visualize(self, batch, nrows=1, ncols=8, labels=[]):
+        X, y = batch
+        if not labels:
+            labels = self.text_labels(y)
+        d2l.show_images(X.squeeze(1), nrows, ncols, titles=labels)
+
+
+def pplot(x, y, xlabel, ylabel, figsize):
+    plt.figure(figsize=figsize)
+    plt.xlabel = xlabel
+    plt.ylabel = ylabel
+    plt.plot(x, y)
+    plt.grid()
+    plt.show()
 
 
 if __name__ == "__main__":
