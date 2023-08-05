@@ -8,6 +8,11 @@ import matplotlib.pyplot as plt
 import torchvision
 from torchvision import transforms
 import torch.nn.functional as F
+import os
+import requests
+import zipfile
+import hashlib
+import tarfile
 
 
 def add_to_class(Class):  # @save
@@ -221,13 +226,14 @@ class Trainer(HyperParameters):
                     self.acc = self.model.accuracy(y_hat, batch[-1])
             self.val_batch_idx += 1
         self.validate_loss.append(self.v_loss.item())
-        self.acc_array.append(self.acc.item())
+        if isinstance(self.acc, torch.TensorType):
+            self.acc_array.append(self.acc.item())
 
-    def plot(self, figsize=(5, 2.5)):
+    def plot(self, figsize=(10, 5)):
         plt.figure(1, figsize=figsize)
         plt.plot(self.train_loss, label='train')
-        plt.plot(self.validate_loss, label='validate')
-        plt.plot(self.acc_array, label='accuracy')
+        plt.plot(self.validate_loss, linestyle='dashed', label='validate')
+        plt.plot(self.acc_array, linestyle='dashdot', label='accuracy')
         plt.xlabel = 'epoch'
         plt.ylabel = 'loss'
         plt.legend()
@@ -265,6 +271,26 @@ class Classifier(Module):
 
     def loss(self, y_hat, y):
         return F.cross_entropy(y_hat, y)
+
+
+class LinearRegression(Module):
+    def __init__(self, lr=0.01):
+        super().__init__()
+        self.lr = lr
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.LazyLinear(1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+    def loss(self, y_hat, y):
+        return F.mse_loss(y_hat, y)
+
+    def validate_step(self, batch):
+        y_hat = self.forward(batch[0])
+        return y_hat, self.loss(y_hat, batch[1])
 
 
 class FasionMNIST(DataModule):
@@ -306,6 +332,61 @@ def pplot(x, y, xlabel, ylabel, figsize):
     plt.plot(x, y)
     plt.grid()
     plt.show()
+
+
+def download(url, folder='../data', sha1_hash=None):  # @save
+    """Download a file to folder and return the local filepath."""
+    # if not url.startswith('http'):
+    #     # For back compatability
+    #     url, sha1_hash = DATA_HUB[url]
+    os.makedirs(folder, exist_ok=True)
+    fname = os.path.join(folder, url.split('/')[-1])
+    # Check if hit cache
+    if os.path.exists(fname) and sha1_hash:
+        sha1 = hashlib.sha1()
+        with open(fname, 'rb') as f:
+            while True:
+                data = f.read(1048576)
+                if not data:
+                    break
+                sha1.update(data)
+        if sha1.hexdigest() == sha1_hash:
+            return fname
+    # Download
+    print(f'Downloading {fname} from {url}...')
+    r = requests.get(url, stream=True, verify=True)
+    with open(fname, 'wb') as f:
+        f.write(r.content)
+    return fname
+
+
+def extract(filename, folder=None):  # @save
+    """Extract a zip/tar file into folder."""
+    base_dir = os.path.dirname(filename)
+    _, ext = os.path.splitext(filename)
+    assert ext in ('.zip', '.tar', '.gz'), 'Only support zip/tar files.'
+    if ext == '.zip':
+        fp = zipfile.ZipFile(filename, 'r')
+    else:
+        fp = tarfile.open(filename, 'r')
+    if folder is None:
+        folder = base_dir
+    fp.extractall(folder)
+
+
+def download_extract(name, folder=None):  # @save
+    """Download and extract a zip/tar file."""
+    fname = download(name)
+    base_dir = os.path.dirname(fname)
+    data_dir, ext = os.path.splitext(fname)
+    if ext == '.zip':
+        fp = zipfile.ZipFile(fname, 'r')
+    elif ext in ('.tar', '.gz'):
+        fp = tarfile.open(fname, 'r')
+    else:
+        assert False, 'Only zip/tar files can be extracted.'
+    fp.extractall(base_dir)
+    return os.path.join(base_dir, folder) if folder else data_dir
 
 
 if __name__ == "__main__":
