@@ -272,6 +272,12 @@ class Classifier(Module):
     def loss(self, y_hat, y):
         return F.cross_entropy(y_hat, y)
 
+    def layer_summary(self, x_shape):
+        x = torch.randn(*x_shape)
+        for layer in self.net:
+            x = layer(x)
+            print(layer.__class__.__name__, 'output shape:\t', x.shape)
+
 
 class LinearRegression(Module):
     def __init__(self, lr=0.01):
@@ -387,6 +393,15 @@ def download_extract(name, folder=None):  # @save
         assert False, 'Only zip/tar files can be extracted.'
     fp.extractall(base_dir)
     return os.path.join(base_dir, folder) if folder else data_dir
+
+
+def corr2d(x, k):
+    h, w = k.shape
+    y = torch.zeros((x.shape[0]-h+1, x.shape[1]-w+1))
+    for i in range(y.shape[0]):
+        for j in range(y.shape[1]):
+            y[i, j] = (x[i:i+h, j:j+w]*k).sum()
+    return y
 
 
 if __name__ == "__main__":
