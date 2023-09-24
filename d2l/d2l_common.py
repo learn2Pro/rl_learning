@@ -13,6 +13,7 @@ import requests
 import zipfile
 import hashlib
 import tarfile
+import re
 
 
 def add_to_class(Class):  # @save
@@ -239,6 +240,19 @@ class Trainer(HyperParameters):
         plt.legend()
         plt.show()
 
+    def clip_gradients(self, grad_clip_val, model):
+        params = [(name, p)
+                  for name, p in model.named_parameters() if p.requires_grad]
+        norm = torch.sqrt(sum(torch.sum((p.grad ** 2))
+                          for name, p in params if p.grad is not None))
+        # norm = torch.sqrt(sum(torch.sum((p.grad**2))
+        #                   for name, p in params if p.grad is not None))
+        if norm > grad_clip_val:
+            for name, param in params:
+                if param.grad is None:
+                    continue
+                param.grad[:] *= grad_clip_val / norm
+
 
 class SyntheticRegressionData(DataModule):  # @save
     """Synthetic data for linear regression."""
@@ -402,6 +416,77 @@ def corr2d(x, k):
         for j in range(y.shape[1]):
             y[i, j] = (x[i:i+h, j:j+w]*k).sum()
     return y
+
+
+class Vocab:
+    """
+    Vocabulary for text.
+    """
+
+    def __init__(self, tokens=[], min_freq=0, reserved_tokens=[]) -> None:
+        if tokens and isinstance(tokens[0], list):
+            tokens = [token for line in tokens for token in line]
+        counter = collections.Counter(tokens)
+        self.token_freqs = sorted(
+            counter.items(), key=lambda x: x[1], reverse=True)
+        self.idx_to_token = list(sorted(set(
+            ['<unk>']+reserved_tokens + [token for token, freq in self.token_freqs if freq >= min_freq])))
+        self.token_to_idx = {token: idx for idx,
+                             token in enumerate(self.idx_to_token)}
+
+    def __len__(self):
+        return len(self.idx_to_token)
+
+    def __getitem__(self, tokens):
+        if not isinstance(tokens, (list, tuple)):
+            return self.token_to_idx.get(tokens, self.unk)
+        return [self.__getitem__(token) for token in tokens]
+
+    def to_tokens(self, indices):
+        if hasattr(indices, '__len__') and len(indices) > 1:
+            return [self.idx_to_token[idx] for idx in indices]
+        return self.idx_to_token[indices]
+
+    @property
+    def unk(self):
+        return self.token_to_idx['<unk>']
+
+
+class TimeMachine(DataModule):
+    def __init__(self, batch_size, num_steps, num_train=10000, num_val=5000, fname='timemachine.txt', root='../data'):
+        self.fname = fname
+        self.root = root
+        self.batch_size = batch_size
+        self.num_steps = num_steps
+        self.num_train = num_train
+        self.num_val = num_val
+        corups, self.vocab = self.build(self._download())
+        array = torch.tensor([corups[i:i+num_steps+1]
+                             for i in range(len(corups)-num_steps)])
+        self.array = array
+        self.X, self.Y = array[:, :-1], array[:, 1:]
+
+    def get_dataloader(self, train):
+        idx = slice(0, self.num_train) if train else slice(
+            self.num_train, self.num_train+self.num_val)
+        return self.get_tensorloader([self.X, self.Y], idx)
+
+    def _download(self):
+        with open(self.root+'/'+self.fname) as f:
+            return f.read()
+
+    def _preprocess(self, text):
+        return re.sub('[^A-Za-z]+', ' ', text).lower()
+
+    def _tokenize(self, text):
+        return list(text)
+
+    def build(self, raw_txt, vocab=None):
+        tokens = self._tokenize(self._preprocess(raw_txt))
+        if vocab is None:
+            vocab = Vocab(tokens)
+        corups = [vocab[token] for token in tokens]
+        return corups, vocab
 
 
 if __name__ == "__main__":
