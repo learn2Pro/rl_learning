@@ -453,7 +453,7 @@ class Vocab:
 
 
 class TimeMachine(DataModule):
-    def __init__(self, batch_size, num_steps, num_train=10000, num_val=5000, fname='timemachine.txt', root='../data'):
+    def __init__(self, batch_size, num_steps, num_train=10000, num_val=5000, fname='timemachine.txt', root='../data', device='cpu'):
         self.fname = fname
         self.root = root
         self.batch_size = batch_size
@@ -463,8 +463,8 @@ class TimeMachine(DataModule):
         corups, self.vocab = self.build(self._download())
         array = torch.tensor([corups[i:i+num_steps+1]
                              for i in range(len(corups)-num_steps)])
-        self.array = array
-        self.X, self.Y = array[:, :-1], array[:, 1:]
+        self.array = array.to(device)
+        self.X, self.Y = array[:, :-1].to(device), array[:, 1:].to(device)
 
     def get_dataloader(self, train):
         idx = slice(0, self.num_train) if train else slice(
@@ -487,6 +487,224 @@ class TimeMachine(DataModule):
             vocab = Vocab(tokens)
         corups = [vocab[token] for token in tokens]
         return corups, vocab
+
+
+class RNNScratch(Module):
+    def __init__(self, num_inputs, num_hiddens, sigma=0.01):
+        super().__init__()
+        self.num_inputs = num_inputs
+        self.num_hiddens = num_hiddens
+        self.sigma = sigma
+        self.W_xh = nn.Parameter(torch.randn(num_inputs, num_hiddens)*sigma)
+        self.W_hh = nn.Parameter(torch.randn(num_hiddens, num_hiddens)*sigma)
+        self.b_h = nn.Parameter(torch.zeros(num_hiddens))
+
+    def forward(self, x, state=None):
+        if state is None:
+            state = torch.zeros(
+                (x.shape[1], self.num_hiddens), device=x.device)
+        else:
+            state, = state
+        outputs = []
+        for X in x:
+            # [batch_size, num_inputs]
+            state = torch.tanh(X@self.W_xh+state@self.W_hh+self.b_h)
+            outputs.append(state)
+        return outputs, state
+
+
+class RNNLMScratch(Classifier):
+    def __init__(self, rnn, vocab_size, lr=0.01):
+        super().__init__()
+        self.rnn = rnn
+        self.lr = lr
+        self.vocab_size = vocab_size
+        self.init_params()
+
+    def init_params(self):
+        self.W_hq = nn.Parameter(torch.randn(
+            self.rnn.num_hiddens, self.vocab_size)*self.rnn.sigma)
+        self.b_q = nn.Parameter(torch.zeros(self.vocab_size))
+
+    def train_step(self, batch):
+        y_hat, y = self(*batch[:-1]), F.one_hot(batch[-1],
+                                                self.vocab_size).type(torch.float32)
+        l = self.loss(y_hat, y)
+        return l
+
+    def validate_step(self, batch):
+        y_hat, y = self(*batch[:-1]), F.one_hot(batch[-1],
+                                                self.vocab_size).type(torch.float32)
+        l = self.loss(y_hat, y)
+        return y_hat, l
+
+    def accuracy(self, y_hat, y, averaged=True):
+        cmp = (y_hat == F.one_hot(y, self.vocab_size).type(
+            torch.float32)).type(torch.float32)
+        return cmp.mean() if averaged else cmp
+
+    def one_hot(self, x):
+        return F.one_hot(x.T, self.vocab_size).type(torch.float32)
+
+    def output_layer(self, rnn_outputs):
+        outputs = [H@self.W_hq for H in rnn_outputs]
+        return torch.stack(outputs, dim=1)
+
+    def forward(self, X, state=None):
+        embs = self.one_hot(X)  # [num_steps, batch_size, vocab_size]
+        rnn_outputs, _ = self.rnn(embs, state)
+        return self.output_layer(rnn_outputs)
+
+    def predict(self, prefix, num_preds, vocab, device=None):
+        state, outputs = None, [vocab[prefix[0]]]
+        for i in range(len(prefix)+num_preds-1):
+            X = torch.tensor([[outputs[-1]]], device=device)
+            embs = self.one_hot(X)
+            rnn_outputs, state = self.rnn(embs, state)
+            if i < len(prefix)-1:
+                outputs.append(vocab[prefix[i+1]])
+            else:
+                Y = self.output_layer(rnn_outputs)
+                outputs.append(int(Y.argmax(dim=2).reshape(1)))
+        return ''.join([vocab.idx_to_token[i] for i in outputs])
+
+
+class MTFraEng(DataModule):
+    """The English-French dataset."""
+
+    def __init__(self, batch_size, num_steps=9, num_train=512, num_val=128, device='cpu'):
+        super().__init__()
+        self.batch_size = batch_size
+        self.num_steps = num_steps
+        self.num_train = num_train
+        self.num_val = num_val
+        self.arrays, self.src_vocab, self.tgt_vocab = self._build_arrays(
+            self._download())
+        self.arrays[0].to(device)
+        self.arrays[1].to(device)
+        self.arrays[3].to(device)
+
+    def get_dataloader(self, train):
+        idx = slice(0, self.num_train) if train else (self.num_train, None)
+        return self.get_tensorloader(self.arrays, train, idx)
+
+    def build(self, src_sentences, tgt_sentences):
+        raw_txt = '\n'.join(
+            [src+'\t'+tgt for src, tgt in zip(src_sentences, tgt_sentences)])
+        arrays, _, _ = self._build_arrays(
+            raw_txt, self.src_vocab, self.tgt_vocab)
+        return arrays
+
+    def _build_arrays(self, raw_text, src_vocab=None, tgt_vocab=None):
+        def _build_array(sentences, vocab, is_tgt=False):
+            def pad_or_trim(seq, t): return (seq[:t] if len(
+                seq) > t else seq+['<pad>']*(t-len(seq)))
+            sentences = [pad_or_trim(s, self.num_steps) for s in sentences]
+            if is_tgt:
+                sentences = [['<bos>']+s for s in sentences]
+            if vocab is None:
+                vocab = Vocab(sentences, min_freq=2)
+            array = torch.tensor([vocab[s] for s in sentences])
+            valid_len = (array != vocab['<pad>']).type(torch.int32).sum(1)
+            return array, vocab, valid_len
+        src, tgt = self._tokenize(self._preprocess(
+            raw_text), self.num_train+self.num_val)
+        src_array, src_vocab, src_valid_len = _build_array(src, src_vocab)
+        tgt_array, tgt_vocab, _ = _build_array(tgt, tgt_vocab, True)
+        return ((src_array, tgt_array[:, :-1], src_valid_len, tgt_array[:, 1:]), src_vocab, tgt_vocab)
+
+    def _download(self):
+        with open('../data/fra.txt', encoding='utf-8') as f:
+            return f.read()
+
+    def _preprocess(self, text: str):
+        # Replace non-breaking space with space
+        text = text.replace('\u202f', ' ').replace('\xa0', ' ')
+        # Insert space between words and punctuation marks
+        def no_space(
+            char, prev_char): return char in ',.!?' and prev_char != ' '
+        out = [' '+char if i > 0 and no_space(char, text[i-1])
+               else char for i, char in enumerate(text.lower())]
+        return ''.join(out)
+
+    def _tokenize(self, text: str, max_examples=None):
+        src, tgt = [], []
+        for i, line in enumerate(text.split('\n')):
+            if max_examples and i > max_examples:
+                break
+            parts = line.split('\t')
+            if len(parts) == 2:
+                src.append([t for t in parts[0].split(' ') if t]+['<eos>'])
+                tgt.append([t for t in parts[1].split(' ') if t]+['<eos>'])
+        return src, tgt
+
+
+class Encoder(Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, X, *args):
+        raise NotImplementedError
+
+
+class Decoder(Module):
+    """The base decoder interface for the encoder--decoder architecture."""
+
+    def __init__(self):
+        super().__init__()
+
+    # Later there can be additional arguments (e.g., length excluding padding)
+    def init_state(self, enc_all_outputs, *args):
+        raise NotImplementedError
+
+    def forward(self, X, state):
+        raise NotImplementedError
+
+
+class EncoderDecoder(Classifier):
+    def __init__(self, encoder, decoder):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, enc_x, dec_X, *args):
+        enc_all_outputs = self.encoder(enc_x, *args)
+        dec_state = self.decoder.init_state(enc_all_outputs, *args)
+        return self.decoder(dec_X, dec_state)[0]
+
+    def predict_step(self, batch, device, num_steps, save_attention_weights=False):
+        batch = [a.to(device) for a in batch]
+        src, tgt, src_valid_len, _ = batch
+        enc_all_outputs = self.encoder(src, src_valid_len)
+        dec_state = self.decoder.init_state(enc_all_outputs, src_valid_len)
+        outputs, attention_weights = [tgt[:, 0].unsqueeze(1),], []
+        for _ in range(num_steps):
+            Y, dec_state = self.decoder(outputs[-1], dec_state)
+            outputs.append(Y.argmax(2))
+            if save_attention_weights:
+                attention_weights.append(self.decoder.attention_weights)
+        return torch.cat(outputs[1:], 1), attention_weights
+
+
+def bleu(pred_seq, label_seq, k):
+    """Compute the BLEU."""
+    import math
+    pred_tokens, label_tokens = pred_seq.split(' '), label_seq.split(' ')
+    len_pred, len_label = len(pred_tokens), len(label_tokens)
+    score = math.exp(min(0, 1 - len_label/len_pred))
+    # A,B,C,D,E,F
+    # A,B,B,C,D
+    # len_pred=6, len_label=5
+    for n in range(1, min(k, len_pred) + 1):
+        num_matches, label_subs = 0, collections.defaultdict(int)
+        for i in range(len_label - n + 1):
+            label_subs[' '.join(label_tokens[i: i + n])] += 1
+        for i in range(len_pred - n + 1):
+            if label_subs[' '.join(pred_tokens[i: i + n])] > 0:
+                num_matches += 1
+                label_subs[' '.join(pred_tokens[i: i + n])] -= 1
+        score *= math.pow(num_matches / (len_pred - n + 1), math.pow(0.5, n))
+    return score
 
 
 if __name__ == "__main__":
