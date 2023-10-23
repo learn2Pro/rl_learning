@@ -648,6 +648,27 @@ class Encoder(Module):
         raise NotImplementedError
 
 
+class Seq2SeqEncoder(Encoder):
+    """The RNN encoder for sequence-to-sequence learning."""
+
+    def __init__(self, vocab_size, embed_size, num_hiddens, num_layers, dropout=0, device='cpu'):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embedding = nn.Embedding(vocab_size, embed_size).to(device)
+        self.rnn = nn.GRU(embed_size, num_hiddens, num_layers,
+                          dropout=dropout).to(device)
+        self.apply(init_seq2seq)
+
+    def forward(self, X, *args):
+        # X shape: (batch_size, num_steps)
+        embs = self.embedding(X.T.type(torch.int64))
+        # embs.shape = (num_steps, batch_size, embed_size)
+        outputs, state = self.rnn(embs)
+        # outputs.shape = (num_steps, batch_size, num_hiddens)
+        # state.shape = (num_layers, batch_size, num_hiddens)
+        return outputs, state
+
+
 class Decoder(Module):
     """The base decoder interface for the encoder--decoder architecture."""
 
@@ -685,6 +706,168 @@ class EncoderDecoder(Classifier):
             if save_attention_weights:
                 attention_weights.append(self.decoder.attention_weights)
         return torch.cat(outputs[1:], 1), attention_weights
+
+
+class Seq2Seq(EncoderDecoder):
+    """The RNN encoder--decoder for sequence to sequence learning."""
+
+    def __init__(self, encoder, decoder, tgt_pad, lr):
+        super().__init__(encoder, decoder)
+        self.tgt_pad = tgt_pad
+        self.lr = lr
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
+
+    def loss(self, y_hat, y):
+        l = super().loss(y_hat, y)
+        mask = (y.reshape(-1) != self.tgt_pad).type(torch.float32)
+        return (l*mask).sum()/mask.sum()
+
+    def accuracy(self, y_hat, y, averaged=True):
+        return 0.0
+
+    def validate_step(self, batch):
+        Y_hat = self(*batch[:-1])
+        Y = self.one_hot(batch[-1])
+        return Y_hat, self.loss(Y_hat, Y)
+
+    def train_step(self, batch):
+        Y_hat = self(*batch[:-1])
+        Y = self.one_hot(batch[-1])
+        return self.loss(Y_hat, Y)
+
+    def one_hot(self, input):
+        return F.one_hot(input, self.decoder.vocab_size)[:, -1, :]
+
+
+class AttentionDecoder(Decoder):
+    def __init__(self):
+        super().__init__()
+
+    @property
+    def attention_weights(self):
+        raise NotImplementedError
+
+
+def masked_softmax(X, valid_lens):
+    def _sequence_mask(X, valid_len, value=0):
+        mask = torch.arange(X.shape[-1]) < valid_len.view(-1, 1)
+        X[~mask] = value
+        return X
+
+    if valid_lens is None:
+        return F.softmax(X, dim=-1)
+    else:
+        shape = X.shape
+        if valid_lens.dim() == 1:
+            valid_lens = torch.repeat_interleave(valid_lens, shape[1])
+        else:
+            valid_lens = valid_lens.view(-1)
+        X = _sequence_mask(X.view(-1, shape[-1]), valid_lens, value=-1e6)
+        return F.softmax(X.view(shape), dim=-1)
+
+
+class DotProductAttention(nn.Module):
+    def __init__(self, dropout=0.0) -> None:
+        super().__init__()
+        self.dropout = dropout
+
+    def forward(self, queries, keys, values, valid_len=None):
+        d = queries.shape[-1]
+        scores = queries@keys.transpose(1, 2) / d**0.5
+        self.attn_weights = masked_softmax(scores, valid_len)
+        return self.attn_weights@values
+
+
+class AdditiveAttention(nn.Module):
+    """Additive attention."""
+
+    def __init__(self, num_hiddens, dropout, **kwargs):
+        super().__init__()
+        self.W_k = nn.LazyLinear(num_hiddens, bias=False)
+        self.W_q = nn.LazyLinear(num_hiddens, bias=False)
+        self.W_v = nn.LazyLinear(1, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, queries, keys, values, valid_lens):
+        queries, keys = self.W_q(queries), self.W_k(keys)
+        # queries=(batch_size, no. of queries, 1, num_hiddens)
+        # keys=(batch_size, 1, no. of key-value pair, num_hiddens)
+        features = queries.unsqueeze(2) + keys.unsqueeze(1)
+        features = F.tanh(features)
+        # scores = (batch_size, no. of queries, no. of key-value pair)
+        scores = self.W_v(features).squeeze(-1)
+        self.attn_weights = masked_softmax(scores, valid_lens)
+        return self.dropout(self.attn_weights) @ values
+
+
+class MultiHeadAttention(Module):
+    def __init__(self, num_hiddens, num_heads, dropout=0.1, bias=False, **kwargs):
+        super().__init__()
+        self.num_hiddens = num_hiddens
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.attention = DotProductAttention(dropout)
+        self.W_q = nn.LazyLinear(num_hiddens, bias=bias)
+        self.W_k = nn.LazyLinear(num_hiddens, bias=bias)
+        self.W_v = nn.LazyLinear(num_hiddens, bias=bias)
+        self.W_o = nn.LazyLinear(num_hiddens, bias=bias)
+
+    def transpose_qkv(self, X):
+        # shape: (batch_size, no. of qkv, num_heads, num_hiddens/num_heads)
+        X = X.reshape(X.shape[0], X.shape[1], self.num_heads, -1)
+        X = X.permute(0, 2, 1, 3)
+        # shape: (batch_size * num_heads, no. of q or kv, num_hiddens / num_heads)
+        return X.reshape(-1, X.shape[2], X.shape[3])
+
+    def transpose_output(self, X):
+        # shape: (batch_size, num_heads, no. of qkv, num_hiddens / num_heads)
+        X = X.reshape(-1, self.num_heads, X.shape[1], X.shape[2])
+        # shape: (batch_size, no. of qkv, num_heads, num_hiddens / num_heads)
+        X = X.permute(0, 2, 1, 3)
+        # shape: (batch_size, no. of qkv, num_hiddens)
+        return X.reshape(X.shape[0], X.shape[1], -1)
+
+    def forward(self, queries, keys, values, valid_lens):
+        queries = self.transpose_qkv(self.W_q(queries))
+        keys = self.transpose_qkv(self.W_k(keys))
+        values = self.transpose_qkv(self.W_v(values))
+
+        if valid_lens is not None:
+            valid_lens = torch.repeat_interleave(
+                valid_lens, repeats=self.num_heads, dim=0)
+
+        # shape of output: (batch_size, num_heads, no. of qkv, num_hiddens / num_heads)
+        output = self.attention(queries, keys, values, valid_lens)
+        # shape of output_concat: (batch_size, no. of qkv, num_hiddens)
+        output_concat = self.transpose_output(output)
+        return self.W_o(output_concat)
+
+
+class PositionEncoding(nn.Module):
+    def __init__(self, num_hiddens, dropout, max_len=1000):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.P = torch.zeros(1, max_len, num_hiddens)
+        X = torch.arange(max_len, dtype=torch.float32).reshape(-1, 1) / \
+            torch.pow(10000, torch.arange(0, num_hiddens,
+                      2, dtype=torch.float32) / num_hiddens)
+        self.P[:, :, 0::2] = torch.sin(X)
+        self.P[:, :, 1::2] = torch.cos(X)
+
+    def forward(self, X):
+        X = X + self.P[:, :X.shape[1], :].to(X.device)
+        return self.dropout(X)
+
+
+def init_seq2seq(module):
+    if type(module) == nn.Linear:
+        nn.init.xavier_uniform_(module.weight)
+    elif type(module) == nn.GRU:
+        for param in module._flat_weights_names:
+            if 'weight' in param:
+                nn.init.xavier_uniform_(module._parameters[param])
 
 
 def bleu(pred_seq, label_seq, k):
