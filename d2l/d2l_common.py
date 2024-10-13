@@ -16,7 +16,128 @@ import tarfile
 import re
 import math
 
+DATA_URL = 'http://d2l-data.s3-accelerate.amazonaws.com/'
 
+from d2l import torch as d2l
+
+def train_ch13(net, train_iter, test_iter, loss, trainer, num_epochs, devices):
+    """Train and evaluate a model with CPU or GPU."""
+    timer, num_batches = d2l.Timer(), len(train_iter)
+    animator = d2l.Animator(xlabel='epoch', xlim=[1, num_epochs], ylim=[0, 1],
+                            legend=['train loss', 'train acc', 'test acc'])
+    net = nn.DataParallel(net, device_ids=devices).to(devices[0])
+    for epoch in range(num_epochs):
+        metric = d2l.Accumulator(3)
+        net.train()
+        for i, (features, labels) in enumerate(train_iter):
+            timer.start()
+            l, acc = d2l.train_batch_ch13(net, features, labels, loss, trainer, devices)
+            metric.add(l, acc, labels.shape[0])
+            timer.stop()
+            if (i + 1) % (num_batches // 5) == 0 or i == num_batches - 1:
+                animator.add(epoch + (i + 1) / num_batches,
+                             (metric[0] / metric[2], metric[1] / metric[2], None))
+        test_acc = d2l.evaluate_accuracy_gpu(net, test_iter)
+        animator.add(epoch + 1, (None, None, test_acc))
+    print(f'loss {metric[0] / metric[2]:.3f}, train acc {metric[1] / metric[2]:.3f}, '
+          f'test acc {test_acc:.3f}')
+    print(f'{metric[2] * num_epochs / timer.sum():.1f} examples/sec on '
+          f'{str(devices)}')
+    
+#@save
+class TokenEmbedding:
+    """Token Embedding."""
+    def __init__(self, embedding_name):
+        self.idx_to_token, self.idx_to_vec = self._load_embedding(
+            embedding_name)
+        self.unknown_idx = 0
+        self.token_to_idx = {token: idx for idx, token in
+                             enumerate(self.idx_to_token)}
+
+    def _load_embedding(self, embedding_name):
+        idx_to_token, idx_to_vec = ['<unk>'], []
+        extract('../data/'+embedding_name+'.zip')
+        # GloVe website: https://nlp.stanford.edu/projects/glove/
+        # fastText website: https://fasttext.cc/
+        with open(os.path.join('../data', embedding_name, 'vec.txt'), 'r') as f:
+            for line in f:
+                elems = line.rstrip().split(' ')
+                token, elems = elems[0], [float(elem) for elem in elems[1:]]
+                # Skip header information, such as the top row in fastText
+                if len(elems) > 1:
+                    idx_to_token.append(token)
+                    idx_to_vec.append(elems)
+        idx_to_vec = [[0] * len(idx_to_vec[0])] + idx_to_vec
+        return idx_to_token, torch.tensor(idx_to_vec)
+
+    def __getitem__(self, tokens):
+        indices = [self.token_to_idx.get(token, self.unknown_idx)
+                   for token in tokens]
+        vecs = self.idx_to_vec[torch.tensor(indices)]
+        return vecs
+
+    def __len__(self):
+        return len(self.idx_to_token)
+    
+#@save
+def read_imdb(data_dir, is_train):
+    """Read the IMDb review dataset text sequences and labels."""
+    data, labels = [], []
+    for label in ('pos', 'neg'):
+        folder_name = os.path.join(data_dir, 'train' if is_train else 'test', label)
+        for file in os.listdir(folder_name):
+            with open(os.path.join(folder_name, file), 'rb') as f:
+                review = f.read().decode('utf-8').replace('\n', '')
+                data.append(review)
+                labels.append(1 if label == 'pos' else 0)
+    return data, labels
+
+
+def load_data_imdb(batch_size, num_steps=500):
+    data_dir = download_extract(DATA_URL + 'aclImdb_v1.tar.gz', 'aclImdb')
+    train_data, train_labels = read_imdb(data_dir, is_train=True)
+    test_data, test_labels = read_imdb(data_dir, is_train=True)
+    train_tokens = tokenize(train_data, token='word')
+    test_tokens = tokenize(test_data, token='word')
+    vocab = Vocab(train_tokens, min_freq=5)
+    train_features = torch.tensor([truncate_pad(vocab[line], num_steps, vocab['<pad>']) for line in train_tokens])
+    test_features = torch.tensor([truncate_pad(vocab[line], num_steps, vocab['<pad>']) for line in test_tokens])
+    train_iter = load_array((train_features, torch.tensor(train_labels)), batch_size)
+    test_iter = load_array((test_features, torch.tensor(test_labels)), batch_size, is_train=False)
+    return train_iter, test_iter, vocab
+
+# BEGIN: d2l load_array source code
+def load_array(data_arrays, batch_size, is_train=True):
+    """Construct a PyTorch data iterator."""
+    dataset = torch.utils.data.TensorDataset(*data_arrays)
+    return torch.utils.data.DataLoader(dataset, batch_size, shuffle=is_train)
+# END:
+
+def truncate_pad(line, num_steps, padding_token):
+    """Truncate or pad sequences."""
+    if len(line) > num_steps:
+        return line[:num_steps]
+    return line + [padding_token] * (num_steps - len(line))
+
+
+def tokenize(lines, token='word'):  #@save
+    """Split text lines into word or character tokens."""
+    if token == 'word':
+        return [line.split() for line in lines]
+    elif token == 'char':
+        return [list(line) for line in lines]
+    else:
+        print('ERROR: unknown token type: ' + token)
+
+def count_corpus(tokens):
+    """Count token frequencies."""
+    # Flatten a list of list of tokens into a list of tokens
+    if len(tokens) == 0 or isinstance(tokens[0], list):
+        tokens = [token for line in tokens for token in line]
+        # print(tokens)
+    return collections.Counter(tokens)
+
+    
 def add_to_class(Class):  # @save
     """Register functions as methods in created class."""
     def wrapper(obj):
@@ -406,9 +527,9 @@ def download_extract(name, folder=None):  # @save
         fp = tarfile.open(fname, 'r')
     else:
         assert False, 'Only zip/tar files can be extracted.'
+    print(f'Extracting {fname} in {base_dir}...')
     fp.extractall(base_dir)
     return os.path.join(base_dir, folder) if folder else data_dir
-
 
 def corr2d(x, k):
     h, w = k.shape
@@ -419,21 +540,27 @@ def corr2d(x, k):
     return y
 
 
-class Vocab:
-    """
-    Vocabulary for text.
-    """
-
-    def __init__(self, tokens=[], min_freq=0, reserved_tokens=[]) -> None:
-        if tokens and isinstance(tokens[0], list):
-            tokens = [token for line in tokens for token in line]
-        counter = collections.Counter(tokens)
-        self.token_freqs = sorted(
-            counter.items(), key=lambda x: x[1], reverse=True)
-        self.idx_to_token = list(sorted(set(
-            ['<unk>']+reserved_tokens + [token for token, freq in self.token_freqs if freq >= min_freq])))
-        self.token_to_idx = {token: idx for idx,
-                             token in enumerate(self.idx_to_token)}
+class Vocab:  #@save
+    """Vocabulary for text."""
+    def __init__(self, tokens=None, min_freq=0, reserved_tokens=None):
+        if tokens is None:
+            tokens = []
+        if reserved_tokens is None:
+            reserved_tokens = []
+        # Sort according to frequencies
+        counter = count_corpus(tokens)
+        self._token_freqs = sorted(counter.items(), key=lambda x: x[1],
+                                   reverse=True)
+        # The index for the unknown token is 0
+        self.idx_to_token = ['<unk>'] + reserved_tokens
+        self.token_to_idx = {token: idx
+                             for idx, token in enumerate(self.idx_to_token)}
+        for token, freq in self._token_freqs:
+            if freq < min_freq:
+                break
+            if token not in self.token_to_idx:
+                self.idx_to_token.append(token)
+                self.token_to_idx[token] = len(self.idx_to_token) - 1
 
     def __len__(self):
         return len(self.idx_to_token)
@@ -444,13 +571,17 @@ class Vocab:
         return [self.__getitem__(token) for token in tokens]
 
     def to_tokens(self, indices):
-        if hasattr(indices, '__len__') and len(indices) > 1:
-            return [self.idx_to_token[idx] for idx in indices]
-        return self.idx_to_token[indices]
+        if not isinstance(indices, (list, tuple)):
+            return self.idx_to_token[indices]
+        return [self.idx_to_token[index] for index in indices]
 
     @property
-    def unk(self):
-        return self.token_to_idx['<unk>']
+    def unk(self):  # Index for the unknown token
+        return 0
+
+    @property
+    def token_freqs(self):  # Index for the unknown token
+        return self._token_freqs
 
 
 class TimeMachine(DataModule):
