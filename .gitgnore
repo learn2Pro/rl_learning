@@ -1,3 +1,6 @@
 data/
 *.pyc
 */__pycache__
+**/data/
+**/*_data/
+**/home_credit_data/
