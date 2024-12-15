@@ -1,0 +1,9 @@
+**/data/
+*.pyc
+*/__pycache__
+**/wandb/
+**/experiments/
+**/data/
+**/*_data/
+**/home_credit_data/
+llm/llama/Llama-3-8B-Instruct-Finance-RAG/
