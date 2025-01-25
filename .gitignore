@@ -8,3 +8,4 @@
 **/home_credit_data/
 llm/llama/Llama-3-8B-Instruct-Finance-RAG/
 llm/finetune/lora_qwen25_coder_7b/
+*.pth
