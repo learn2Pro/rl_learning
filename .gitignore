@@ -11,3 +11,4 @@ llm/finetune/lora_qwen25_coder_7b/
 *.ttf
 *.pdf
 *.docx
+*.pth
