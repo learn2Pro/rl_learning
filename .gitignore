@@ -16,3 +16,4 @@ llm/finetune/lora_qwen25_coder_7b/
 **/.ipynb_checkpoints
 **/outputs
 **/output
+**/results
