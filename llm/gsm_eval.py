@@ -1,12 +1,12 @@
 import lighteval
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from lighteval.metrics.utils.metric_utils import MetricCategory, MetricUseCase, SampleLevelMetric
+import numpy as np
 from lighteval.metrics.dynamic_metrics import (
-    ExprExtractionConfig,
-    IndicesExtractionConfig,
-    LatexExtractionConfig,
-    multilingual_extractive_match_metric,
+    multilingual_quasi_exact_match_metric
 )
+from lighteval.utils.language import Language
 
 # gsm8k
 SYSTEM_PROMPT = """
@@ -32,16 +32,33 @@ def prompt_fn(line, task_name: str = None):
     return Doc(
         task_name=task_name,
         query=line["question"],
-        choices=[f" {c}" for c in line["choices"]],
-        gold_index=extract_hash_answer(line),
-        instruction=SYSTEM_PROMPT,
+        choices=[extract_hash_answer(l) for l in line["answer"]],
+        gold_index=0,
     )
-
-custom_metric = SampleLevelMetric(
-    metric_name="my_custom_metric_name",
-    higher_is_better=True,
-    category=MetricCategory.IGNORED,
-    use_case=MetricUseCase.NONE,
-    sample_level_fn=lambda x: x,  # how to compute score for one sample
-    corpus_level_fn=np.mean,  # How to aggreagte the samples metrics
+    
+gsm_acc_metric = multilingual_quasi_exact_match_metric(
+    language=Language.ENGLISH,
 )
+
+
+# This is how you create a simple task (like hellaswag) which has one single subset
+# attached to it, and one evaluation possible.
+task = LightevalTaskConfig(
+    name="gsm_acc_metric",
+    prompt_function=prompt_fn,  # must be defined in the file or imported from src/lighteval/tasks/tasks_prompt_formatting.py
+    suite=["community"],
+    hf_repo="openai/gsm8k",
+    hf_subset="main",
+    hf_avail_splits=['test'],
+    evaluation_splits=['test'],
+    few_shots_split=None,
+    few_shots_select=None,
+    metric=[gsm_acc_metric],  # select your metric in Metrics
+)
+
+
+# tasks with subset:
+TASKS_TABLE = [task]
+
+
+
