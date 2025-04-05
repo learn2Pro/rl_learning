@@ -20,7 +20,8 @@ Responde in the following format:
 """
 
 def prompt_fn(line, task_name: str = None):
-    """Defines how to go from a dataset line to a doc object.
+    """
+    Defines how to go from a dataset line to a doc object.
     Follow examples in src/lighteval/tasks/default_prompts.py, or get more info
     about what this function should do in the README.
     """
@@ -58,6 +59,7 @@ task = LightevalTaskConfig(
 
 
 # tasks with subset:
+# community|gsm_acc_metric|0|0
 TASKS_TABLE = [task]
 
 

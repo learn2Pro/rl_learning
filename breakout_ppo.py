@@ -5,7 +5,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import Categorical
 import torchvision.transforms as T
-
+from transformers import Trainer,DataCollatorForLanguageModeling
 
 # 定义策略网络
 
