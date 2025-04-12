@@ -17,3 +17,5 @@ llm/finetune/lora_qwen25_coder_7b/
 **/outputs
 **/output
 **/results
+llm/fineweb10B
+llm/tinyshakespeare
