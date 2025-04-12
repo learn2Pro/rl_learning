@@ -4,10 +4,39 @@ import torch.nn as nn
 
 from dataclasses import dataclass
 from transformers import PretrainedConfig, AutoConfig, AutoModelForCausalLM
+from transformers import PreTrainedModel
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 FLASH = 0
 
+# rope
+def precompute_freqs_cis(dim, end, theta=10000.0):
+    freqs = theta ** -(torch.arange(0, dim, 2)[:dim//2].float() / dim)
+    t = torch.arange(end)
+    freqs = torch.outer(t, freqs) # m * \theta
+    # freqs = t * freqs
+    freqs = torch.polar(torch.ones_like(freqs), freqs) # cos(m * \theta) + jsin(m * \theta)
+    return freqs
+
+# 2. 为广播 reshape freqs
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    if freqs_cis.shape[0] > x.shape[1]:
+        freqs_cis = freqs_cis[:x.shape[1]]
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [1 if i != 1 and i != x.ndim - 1 else x.shape[i] for i in range(x.ndim)]
+    return freqs_cis.view(*shape).to(x.device)
+
+def apply_rotary_emb(q, k, freqs):
+    xq = torch.view_as_complex(q.view(*q.shape[:-1], -1, 2)) # batch, seq_len, n_head, dim//2
+    xk = torch.view_as_complex(k.view(*k.shape[:-1], -1, 2)) # batch, seq_len, n_head, dim//2
+    
+    freqs_cis = reshape_for_broadcast(freqs, xq) # freqs_cis.shape = (1,x.shape[1],1,x.shape[-1])
+
+    xq_out = torch.view_as_real(xq * freqs_cis).flatten(3) # batch, seq_len, n_head, dim
+    xk_out = torch.view_as_real(xk * freqs_cis).flatten(3) # batch, seq_len, n_head, dim
+
+    return xq_out.type_as(q), xk_out.type_as(k)
+    
 @dataclass
 class GPTConfig(PretrainedConfig):
     n_block: int
@@ -18,13 +47,12 @@ class GPTConfig(PretrainedConfig):
     model_type: str = 'buddygpt'
     pad_token_id=None,
     bos_token_id=None,
-    eos_token_id=None,
+    eos_token_id=50256,
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-from transformers import PreTrainedModel
 
 
 class SwiGLU(nn.Module):
@@ -43,6 +71,7 @@ class SelfCausalAttention(nn.Module):
         self.n_block = config.n_block
         self.c_attn = nn.Linear(config.n_embed, 3 * config.n_embed)
         self.c_proj = nn.Linear(config.n_embed, config.n_embed)
+        self.freqs_cis = precompute_freqs_cis(config.n_embed // config.n_head, config.n_block * 2)
         self.register_buffer('tril', torch.tril(torch.ones(config.n_block, config.n_block)).view(1,1,config.n_block,config.n_block))
 
     def forward(self, x):
@@ -52,6 +81,7 @@ class SelfCausalAttention(nn.Module):
         q = q.view(B, T, self.n_head, -1).transpose(1, 2) # B, n_head, n_block, n_embed//n_head
         k = k.view(B, T, self.n_head, -1).transpose(1, 2) # B, n_head, n_block, n_embed//n_head
         v = v.view(B, T, self.n_head, -1).transpose(1, 2) # B, n_head, n_block, n_embed//n_head
+        q, k = apply_rotary_emb(q, k, self.freqs_cis)
         if FLASH:
             o_attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
@@ -104,11 +134,12 @@ class BuddyGPT(PreTrainedModel):
             ln_norm = nn.RMSNorm(config.n_embed),
         ))
         self.lm_head = nn.Linear(config.n_embed, config.n_vocab, bias=False)
+        self.eos_token_id = config.eos_token_id
         self.transformer.wte.weight = self.lm_head.weight
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(42)
         self.apply(self._init_weights)
-        self.eos_token_id = 151645
+        
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
