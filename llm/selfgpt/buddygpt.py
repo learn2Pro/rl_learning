@@ -106,7 +106,7 @@ class GQA(nn.Module):
         self.k_proj = nn.Linear(self.n_embed, self.kv_head_dim)
         self.v_proj = nn.Linear(self.n_embed, self.kv_head_dim)
         self.out_proj = nn.Linear(self.n_embed, self.n_embed)
-        self.rope = config.rope
+        self.rope = RotaryEmbedding(config.n_embed)
         self.register_buffer('tril', torch.tril(torch.ones(config.n_block, config.n_block)).view(1,1,config.n_block, config.n_block))
 
     def forward(self, x):
@@ -199,12 +199,11 @@ class BuddyGPT(PreTrainedModel):
         super().__init__(config)
         self.config = config
         self.n_vocab = config.n_vocab
-        config.rope = RotaryEmbedding(config.n_embed)
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.n_vocab, config.n_embed),
             layers = nn.ModuleList([Layer(config) for _ in range(config.n_layer)]),
             ln_norm = nn.RMSNorm(config.n_embed),
-            rope = config.rope,
+            rope = RotaryEmbedding(config.n_embed),
         ))
 
         self.lm_head = nn.Linear(config.n_embed, config.n_vocab, bias=False)
