@@ -54,15 +54,42 @@ class RotaryEmbedding(nn.Module):
     def apply_rotary_emb(self, q, k=None):
         seq_len, dim = q.size(1), q.size(-1) # batch, n_head, seq_len, n_embed
         freqs_cis = self.freqs[None, :seq_len, None, :dim//2].contiguous().to(q.device)
+        q = q.float()
         xq = torch.view_as_complex(q.view(*q.shape[:-1], -1, 2))
         xq_out = torch.view_as_real(xq * freqs_cis).flatten(3)
         if k is not None:
+            k = k.float()
             xk = torch.view_as_complex(k.view(*k.shape[:-1], -1, 2))
             xk_out = torch.view_as_real(xk * freqs_cis).flatten(3)
-            return xq_out, xk_out
+            return xq_out.to(torch.bfloat16), xk_out.to(torch.bfloat16)
         else:
-            return xq_out           
+            return xq_out.to(torch.bfloat16)
+            
+# class RotaryEmbedding(torch.nn.Module):
+#     def __init__(self, dim, theta=10000):
+#         super().__init__()
+#         self.dim = dim
+#         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+#         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
+#     def apply_rotary_emb(self, x):
+#         # x: (batch, seq_len, n_heads, head_dim)
+#         seq_len = x.shape[1]
+
+#         # 生成旋转角度
+#         t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+#         freqs = torch.einsum("i,j->ij", t, self.inv_freq)  # (seq_len, dim // 2)
+#         emb = torch.cat((freqs, freqs), dim=-1)  # (seq_len, dim)
+
+#         cos = emb.cos()[None, :, None, :]  # (1, seq_len, 1, dim)
+#         sin = emb.sin()[None, :, None, :]  # (1, seq_len, 1, dim)
+
+#         # 应用旋转，使用实数方式替代复数旋转
+#         x1, x2 = x[..., ::2], x[..., 1::2]
+#         x_rotated_even = x1 * cos[..., ::2] - x2 * sin[..., ::2]
+#         x_rotated_odd = x1 * sin[..., ::2] + x2 * cos[..., ::2]
+#         x_out = torch.stack((x_rotated_even, x_rotated_odd), dim=-1)
+#         return x_out.flatten(-2)  # 恢复回 (batch, seq_len, n_heads, head_dim)
         
 @dataclass
 class GPTConfig(PretrainedConfig):
